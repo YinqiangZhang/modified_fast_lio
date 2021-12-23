@@ -55,10 +55,13 @@
 #include <sensor_msgs/PointCloud2.h>
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
+#include <tf/transform_listener.h>
 #include <geometry_msgs/Vector3.h>
 #include <livox_ros_driver/CustomMsg.h>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
+
+#include "fast_lio/global_positioning.h"
 
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
@@ -72,6 +75,7 @@ double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
 /**************************/
+ros::ServiceClient gp_client;
 
 float res_last[100000] = {0.0};
 float DET_RANGE = 300.0f;
@@ -130,7 +134,7 @@ esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
 state_ikfom state_point;
 vect3 pos_lid;
 
-nav_msgs::Path path;
+nav_msgs::Path path; // what's the meaning of path?
 nav_msgs::Odometry odomAftMapped;
 geometry_msgs::Quaternion geoQuat;
 geometry_msgs::PoseStamped msg_body_pose;
@@ -276,7 +280,7 @@ void lasermap_fov_segment()
 
 void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg) 
 {
-    mtx_buffer.lock();
+    mtx_buffer.lock(); // metex signal
     scan_count ++;
     double preprocess_start_time = omp_get_wtime();
     if (msg->header.stamp.toSec() < last_timestamp_lidar)
@@ -360,10 +364,54 @@ void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
     sig_buffer.notify_all();
 }
 
+// TODO: external imu callback function
+bool plane_set = false;
+tf::Quaternion old_q;
+int plane_count = 0;
+double time_diff_two_imus = 0.42;
+void external_imu_cbk (const sensor_msgs::Imu::ConstPtr &msg_in) 
+{   
+    mtx_buffer.lock();
+    tf::Quaternion base_q;
+    base_q.setW(msg_in->orientation.w);
+    base_q.setX(msg_in->orientation.x);
+    base_q.setY(msg_in->orientation.y);
+    base_q.setZ(msg_in->orientation.z);
+    base_q.normalize();
+
+    double roll, pitch, yaw;
+    tf::Matrix3x3 delta_matrix(base_q);
+    delta_matrix.getRPY(roll, pitch, yaw);
+    base_q.setRPY(roll, pitch, 0);
+
+    tf::TransformBroadcaster br;
+    tf::Transform transform_world;
+    transform_world.setOrigin(tf::Vector3(0, 0, 0));
+    transform_world.setRotation(base_q.inverse());
+    br.sendTransform(tf::StampedTransform(transform_world, ros::Time().fromSec(msg_in->header.stamp.toSec()-time_diff_two_imus), "base_link", "raw_plane"));
+
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+}
+
+
+// global orientation reference service
+bool global_positioning(fast_lio::global_positioning::Request &req, fast_lio::global_positioning::Response &res)
+{
+    mtx_buffer.lock();
+    plane_set = false;
+    res.success = true;
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+    return true;
+}
+
+
 double lidar_mean_scantime = 0.0;
 int    scan_num = 0;
 bool sync_packages(MeasureGroup &meas)
-{
+{   
+    // waiting for the empty of lidar and imu 
     if (lidar_buffer.empty() || imu_buffer.empty()) {
         return false;
     }
@@ -561,7 +609,7 @@ void publish_map(const ros::Publisher & pubLaserCloudMap)
 {
     sensor_msgs::PointCloud2 laserCloudMap;
     pcl::toROSMsg(*featsFromMap, laserCloudMap);
-    laserCloudMap.header.stamp = ros::Time().fromSec(lidar_end_time);
+    laserCloudMap.header.stamp = ros::Time().fromSec(lidar_end_time );
     laserCloudMap.header.frame_id = "odom";
     pubLaserCloudMap.publish(laserCloudMap);
 }
@@ -599,6 +647,7 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
     }
 
     static tf::TransformBroadcaster br;
+    static tf::TransformListener listener;
     tf::Transform                   transform;
     tf::Quaternion                  q;
     transform.setOrigin(tf::Vector3(odomAftMapped.pose.pose.position.x, \
@@ -611,25 +660,42 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
     transform.setRotation( q );
     br.sendTransform( tf::StampedTransform( transform, odomAftMapped.header.stamp, "odom", "base_link" ) );
 
+    /*****************************/
+    /* TODO: add base_link_plane */
+    /*****************************/
 
+    try{
+        tf::StampedTransform odom_world_transform;
+        if (!plane_set){
+            listener.lookupTransform("odom", "raw_plane", ros::Time(0), odom_world_transform);
+            old_q = odom_world_transform.getRotation();
+            plane_set = true;
+        }
 
-    tf::Matrix3x3 rotation_matrix(q);
-    double roll, pitch, yaw;
-    rotation_matrix.getRPY(roll, pitch, yaw);
+        tf::Transform predicted_world;
+        predicted_world.setOrigin(tf::Vector3(odomAftMapped.pose.pose.position.x, \
+                                            odomAftMapped.pose.pose.position.y, \
+                                            odomAftMapped.pose.pose.position.z));
+        predicted_world.setRotation(old_q);
+        br.sendTransform(tf::StampedTransform(predicted_world, odomAftMapped.header.stamp, "odom", "reference_plane" ));
+        
+        listener.lookupTransform("reference_plane", "base_link", ros::Time(0), odom_world_transform);
+        tf::Quaternion delta_q(odom_world_transform.getRotation());
+        
+        double roll, pitch, yaw;
+        tf::Matrix3x3 delta_matrix(delta_q);
+        delta_matrix.getRPY(roll, pitch, yaw);
+        tf::Quaternion new_quat;
+        new_quat.setRPY(0, 0, yaw);
 
-    tf::Quaternion new_quat;
-    new_quat.setRPY(0, 0, yaw);
-    new_quat.normalize();
-
-    tf::Transform transform_plane;
-
-    transform_plane.setOrigin(tf::Vector3(odomAftMapped.pose.pose.position.x, \
-                                          odomAftMapped.pose.pose.position.y, \
-                                          odomAftMapped.pose.pose.position.z));
-
-    transform_plane.setRotation(new_quat);
-
-    br.sendTransform( tf::StampedTransform(transform_plane, odomAftMapped.header.stamp, "odom", "base_link_plane" ) );
+        tf::Transform transform_plane;
+        transform_plane.setOrigin(tf::Vector3(0, 0, 0));
+        transform_plane.setRotation(new_quat);
+        br.sendTransform( tf::StampedTransform(transform_plane, odomAftMapped.header.stamp, "reference_plane", "base_link_plane" ) );
+        
+    }catch(tf::TransformException ex){
+        ROS_WARN("%s",ex.what());
+    }
 
 }
 
@@ -868,9 +934,18 @@ int main(int argc, char** argv)
             ("/Odometry", 100000);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
+
+    // TODO: 
+    // external IMU subscriber
+    ros::Subscriber sub_external_imu = nh.subscribe("/imu/data", 1, external_imu_cbk);
+    // global_positioning service
+    ros::ServiceServer gp_service = nh.advertiseService("global_positioning", global_positioning);
+    // service client
+    gp_client = nh.serviceClient<fast_lio::global_positioning>("global_positioning");
+
 //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
-    ros::Rate rate(5000);
+    ros::Rate rate(1000);
     bool status = ros::ok();
     while (status)
     {
@@ -878,11 +953,14 @@ int main(int argc, char** argv)
         ros::spinOnce();
         if(sync_packages(Measures)) 
         {
-            if (flg_first_scan)
-            {
-                first_lidar_time = Measures.lidar_beg_time;
-                p_imu->first_lidar_time = first_lidar_time;
-                flg_first_scan = false;
+            // process when using the first scan
+            // if (!external_imu_updated){
+            //     continue;
+            // } 
+            if (flg_first_scan){
+                first_lidar_time = Measures.lidar_beg_time; 
+                p_imu->first_lidar_time = first_lidar_time; // give the first LiDAR time to the imu 
+                flg_first_scan = false; // not use this first scan program later 
                 continue;
             }
 

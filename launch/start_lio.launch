@@ -1,0 +1,11 @@
+<launch>
+    <include file="$(find ouster_ros)/os1_32.launch"/>
+    <include file="$(find openzen_sensor)/launch/lpms_cu2.launch"/>
+    <include file="$(find fast_lio)/launch/mapping_ouster64.launch"/>
+    
+      <node pkg="tf" 
+        type="static_transform_publisher" 
+        name="lidar_to_base" 
+        args="0.0 0 0.0 0 0 0 base_link os_sensor 10" />
+    
+</launch>
